@@ -1,0 +1,12 @@
+name = "notifly"
+main = "src/index.ts"
+compatibility_date = "2026-05-18"
+
+[[kv_namespaces]]
+binding = "NOTIFLY_KV"
+id = "replace-with-production-kv-id"
+preview_id = "replace-with-preview-kv-id"
+
+[vars]
+ANDROID_PACKAGE_NAME = "net.extrawdw.notifly"
+DEFAULT_FCM_PRIORITY = "HIGH"
