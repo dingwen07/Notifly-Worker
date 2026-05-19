@@ -66,7 +66,9 @@ export async function verifyPlayIntegrity(
     throw new Error("Integrity token package name mismatch");
   }
   if (request?.nonce !== expectedNonceHash) {
-    throw new Error("Integrity nonce mismatch");
+    throw new Error(
+      `Integrity nonce mismatch: expected ${await describeNonce(expectedNonceHash)}, got ${await describeNonce(request?.nonce)}`
+    );
   }
   if (app?.appRecognitionVerdict !== "PLAY_RECOGNIZED") {
     throw new Error("App is not Play recognized");
@@ -199,4 +201,13 @@ function base64Url(bytes: Uint8Array): string {
     binary += String.fromCharCode(byte);
   });
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+async function describeNonce(nonce: string | undefined): Promise<string> {
+  if (!nonce) {
+    return "missing";
+  }
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(nonce));
+  const fingerprint = base64Url(new Uint8Array(digest)).slice(0, 12);
+  return `len=${nonce.length} sha256=${fingerprint}`;
 }
