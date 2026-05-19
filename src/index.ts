@@ -13,13 +13,13 @@ export default {
         return jsonResponse({ ok: true });
       }
       if (url.pathname === "/v1/integrity/challenge") {
-        return createChallenge(request, env);
+        return await createChallenge(request, env);
       }
       if (url.pathname === "/v1/devices/register") {
-        return registerDevice(request, env);
+        return await registerDevice(request, env);
       }
       if (url.pathname === "/v1/notifications/send") {
-        return sendNotification(request, env);
+        return await sendNotification(request, env);
       }
       return jsonResponse({ error: "Not found" }, { status: 404 });
     } catch (error) {
@@ -76,8 +76,7 @@ async function registerDevice(request: Request, env: Env): Promise<Response> {
     throw new HttpError(401, "Challenge mismatch");
   }
 
-  const nonceHash = await sha256(nonce);
-  const integrityVerdicts = await verifyPlayIntegrity(env, packageName, integrityToken, nonceHash);
+  const integrityVerdicts = await verifyPlayIntegrity(env, packageName, integrityToken, nonce);
   const existingDeviceId = await env.NOTIFLY_KV.get(clientKey(clientId));
   const deviceId = existingDeviceId ?? randomToken(18);
   const apiKey = randomToken(32);
