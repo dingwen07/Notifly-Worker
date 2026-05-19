@@ -10,3 +10,6 @@ preview_id = "9b64a65f555d428aa5b21e1d7305b891"
 [vars]
 ANDROID_PACKAGE_NAME = "net.extrawdw.notifly"
 DEFAULT_FCM_PRIORITY = "HIGH"
+
+[triggers]
+crons = ["0 3 * * *"]

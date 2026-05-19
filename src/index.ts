@@ -1,9 +1,15 @@
 import { randomToken, sha256 } from "./crypto";
 import { HttpError, jsonResponse, readJson, requireMethod } from "./http";
-import { sendFcmDataMessage, verifyPlayIntegrity } from "./google";
+import { FcmSendError, sendFcmDataMessage, sendFcmRawData, verifyPlayIntegrity } from "./google";
 import { ChallengeRecord, DeviceRecord, Env, FcmPriority, SendNotificationRequest, UserRecord } from "./types";
 
 const CHALLENGE_TTL_SECONDS = 300;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const INACTIVITY_STOP_DAYS = 7;
+const INACTIVITY_DELETE_DAYS = 180;
+const INTEGRITY_STALE_DAYS = 30;
+const WAKE_INACTIVE_DAYS = 5;
+const WAKE_INTEGRITY_DAYS = 15;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -12,8 +18,11 @@ export default {
       if (url.pathname === "/health") {
         return jsonResponse({ ok: true });
       }
-      if (url.pathname === "/v1/integrity/challenge") {
+      if (url.pathname === "/v1/devices/integrity/challenge") {
         return await createChallenge(request, env);
+      }
+      if (url.pathname === "/v1/devices/integrity/reverify") {
+        return await reverifyIntegrity(request, env);
       }
       if (url.pathname === "/v1/devices/register") {
         return await registerDevice(request, env);
@@ -34,6 +43,10 @@ export default {
         { status: 500 }
       );
     }
+  },
+
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runDailyMaintenance(env));
   }
 };
 
@@ -98,7 +111,11 @@ async function registerDevice(request: Request, env: Env): Promise<Response> {
     packageName,
     integrityVerdicts,
     registeredAt: existing?.registeredAt ?? now,
-    updatedAt: now
+    updatedAt: now,
+    lastActiveAt: now,
+    integrityVerifiedAt: now,
+    inactive: false,
+    fcmTokenInvalid: false
   };
 
   const writes: Promise<unknown>[] = [
@@ -122,13 +139,19 @@ async function registerDevice(request: Request, env: Env): Promise<Response> {
     apiKey,
     userId: userCredentials.userId,
     userKey: userCredentials.userKey,
-    registeredAt: record.registeredAt
+    registeredAt: record.registeredAt,
+    lastActiveAt: record.lastActiveAt,
+    integrityVerifiedAt: record.integrityVerifiedAt
   });
 }
 
 async function deviceStatus(request: Request, env: Env): Promise<Response> {
   requireMethod(request, "GET");
   const device = await authenticate(request, env);
+  const now = new Date().toISOString();
+  device.lastActiveAt = now;
+  device.inactive = false;
+  await env.NOTIFLY_KV.put(deviceKey(device.deviceId), JSON.stringify(device));
   return jsonResponse({
     registered: true,
     deviceId: device.deviceId,
@@ -137,7 +160,45 @@ async function deviceStatus(request: Request, env: Env): Promise<Response> {
     packageName: device.packageName,
     integrityVerdicts: device.integrityVerdicts,
     registeredAt: device.registeredAt,
-    updatedAt: device.updatedAt
+    updatedAt: device.updatedAt,
+    lastActiveAt: device.lastActiveAt,
+    integrityVerifiedAt: device.integrityVerifiedAt,
+    integrityStale: ageDays(device.integrityVerifiedAt) >= WAKE_INTEGRITY_DAYS,
+    fcmTokenInvalid: device.fcmTokenInvalid === true
+  });
+}
+
+async function reverifyIntegrity(request: Request, env: Env): Promise<Response> {
+  requireMethod(request, "POST");
+  const device = await authenticate(request, env);
+  const body = await readJson<{ integrityToken?: string; nonce?: string }>(request);
+  const integrityToken = requireString(body.integrityToken, "integrityToken");
+  const nonce = requireString(body.nonce, "nonce");
+
+  const challengeRaw = await env.NOTIFLY_KV.get(challengeKey(nonce));
+  if (!challengeRaw) {
+    throw new HttpError(401, "Challenge expired or unknown");
+  }
+  const challenge = JSON.parse(challengeRaw) as ChallengeRecord;
+  if (challenge.clientId !== device.clientId || challenge.expiresAt < Date.now()) {
+    throw new HttpError(401, "Challenge mismatch");
+  }
+
+  const verdicts = await verifyPlayIntegrity(env, device.packageName, integrityToken, [nonce, await sha256(nonce)]);
+  const now = new Date().toISOString();
+  device.integrityVerdicts = verdicts;
+  device.integrityVerifiedAt = now;
+  device.lastActiveAt = now;
+  device.inactive = false;
+  await Promise.all([
+    env.NOTIFLY_KV.put(deviceKey(device.deviceId), JSON.stringify(device)),
+    env.NOTIFLY_KV.delete(challengeKey(nonce))
+  ]);
+  return jsonResponse({
+    deviceId: device.deviceId,
+    integrityVerdicts: verdicts,
+    integrityVerifiedAt: device.integrityVerifiedAt,
+    lastActiveAt: device.lastActiveAt
   });
 }
 
@@ -163,21 +224,53 @@ async function sendNotification(request: Request, env: Env): Promise<Response> {
     throw new HttpError(404, "No target devices found");
   }
 
+  const eligible: DeviceRecord[] = [];
+  const skipped: { deviceId: string; reason: string }[] = [];
+  for (const device of targets) {
+    const reason = ineligibleReason(device);
+    if (reason) skipped.push({ deviceId: device.deviceId, reason });
+    else eligible.push(device);
+  }
+
   const responses = await Promise.allSettled(
-    targets.map((device) => sendFcmDataMessage(env, device.fcmToken, notification, priority as FcmPriority))
+    eligible.map((device) => sendFcmDataMessage(env, device.fcmToken, notification, priority as FcmPriority))
+  );
+
+  await Promise.all(
+    responses.map((result, index) => {
+      if (result.status === "rejected" && result.reason instanceof FcmSendError && result.reason.tokenInvalid) {
+        return markFcmTokenInvalid(env, eligible[index]);
+      }
+      return Promise.resolve();
+    })
   );
 
   return jsonResponse({
     requested: targets.length,
+    eligible: eligible.length,
     sent: responses.filter((result) => result.status === "fulfilled").length,
+    skipped,
     failed: responses
-      .map((result, index) => ({ result, deviceId: targets[index].deviceId }))
+      .map((result, index) => ({ result, deviceId: eligible[index].deviceId }))
       .filter((entry) => entry.result.status === "rejected")
       .map((entry) => ({
         deviceId: entry.deviceId,
         error: entry.result.status === "rejected" ? String(entry.result.reason) : undefined
       }))
   });
+}
+
+function ineligibleReason(device: DeviceRecord): string | undefined {
+  if (device.fcmTokenInvalid) return "fcm_token_invalid";
+  if (device.inactive) return "inactive";
+  if (ageDays(device.lastActiveAt) >= INACTIVITY_STOP_DAYS) return "inactive";
+  if (ageDays(device.integrityVerifiedAt) >= INTEGRITY_STALE_DAYS) return "integrity_stale";
+  return undefined;
+}
+
+async function markFcmTokenInvalid(env: Env, device: DeviceRecord): Promise<void> {
+  device.fcmTokenInvalid = true;
+  await env.NOTIFLY_KV.put(deviceKey(device.deviceId), JSON.stringify(device));
 }
 
 async function authenticate(request: Request, env: Env): Promise<DeviceRecord> {
@@ -260,6 +353,77 @@ async function removeUserDevice(env: Env, userId: string, deviceId: string): Pro
 async function getUserDeviceIds(env: Env, userId: string): Promise<string[]> {
   const raw = await env.NOTIFLY_KV.get(userDevicesKey(userId));
   return raw ? (JSON.parse(raw) as string[]) : [];
+}
+
+async function runDailyMaintenance(env: Env): Promise<void> {
+  let cursor: string | undefined;
+  do {
+    const page = await env.NOTIFLY_KV.list({ prefix: "device:", cursor });
+    for (const entry of page.keys) {
+      const raw = await env.NOTIFLY_KV.get(entry.name);
+      if (!raw) continue;
+      const device = JSON.parse(raw) as DeviceRecord;
+      try {
+        await processDeviceMaintenance(env, device);
+      } catch (error) {
+        console.log(`maintenance failed for ${device.deviceId}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+}
+
+async function processDeviceMaintenance(env: Env, device: DeviceRecord): Promise<void> {
+  const inactiveDays = ageDays(device.lastActiveAt);
+  const integrityDays = ageDays(device.integrityVerifiedAt);
+
+  if (inactiveDays >= INACTIVITY_DELETE_DAYS) {
+    await deleteDevice(env, device);
+    return;
+  }
+
+  if (inactiveDays >= INACTIVITY_STOP_DAYS && device.inactive !== true) {
+    device.inactive = true;
+    await env.NOTIFLY_KV.put(deviceKey(device.deviceId), JSON.stringify(device));
+  }
+
+  if (device.fcmTokenInvalid) return;
+
+  const needsActivityWake = inactiveDays >= WAKE_INACTIVE_DAYS;
+  const needsReverify = integrityDays >= WAKE_INTEGRITY_DAYS;
+  if (!needsActivityWake && !needsReverify) return;
+
+  const kind = needsReverify ? "reverify" : "wake";
+  try {
+    await sendFcmRawData(
+      env,
+      device.fcmToken,
+      { notifly_kind: kind },
+      "NORMAL"
+    );
+  } catch (error) {
+    if (error instanceof FcmSendError && error.tokenInvalid) {
+      await markFcmTokenInvalid(env, device);
+    } else {
+      throw error;
+    }
+  }
+}
+
+async function deleteDevice(env: Env, device: DeviceRecord): Promise<void> {
+  const deletions: Promise<unknown>[] = [
+    env.NOTIFLY_KV.delete(deviceKey(device.deviceId)),
+    env.NOTIFLY_KV.delete(clientKey(device.clientId)),
+    env.NOTIFLY_KV.delete(apiKeyLookupKey(device.apiKeyHash)),
+    removeUserDevice(env, device.userId, device.deviceId)
+  ];
+  await Promise.all(deletions);
+}
+
+function ageDays(iso: string): number {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return Number.POSITIVE_INFINITY;
+  return (Date.now() - t) / DAY_MS;
 }
 
 function requireString(value: unknown, name: string): string {

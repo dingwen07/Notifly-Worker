@@ -28,6 +28,10 @@ export interface DeviceRecord {
   integrityVerdicts: string[];
   registeredAt: string;
   updatedAt: string;
+  lastActiveAt: string;
+  integrityVerifiedAt: string;
+  inactive?: boolean;
+  fcmTokenInvalid?: boolean;
 }
 
 export interface UserRecord {

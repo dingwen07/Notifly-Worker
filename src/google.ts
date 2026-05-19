@@ -97,10 +97,35 @@ export async function verifyPlayIntegrity(
   return deviceVerdicts;
 }
 
+export class FcmSendError extends Error {
+  constructor(public readonly status: number, public readonly errorCode: string | undefined, message: string) {
+    super(message);
+  }
+  get tokenInvalid(): boolean {
+    return TOKEN_INVALID_FCM_CODES.has(this.errorCode ?? "") || this.status === 404;
+  }
+}
+
+const TOKEN_INVALID_FCM_CODES = new Set([
+  "UNREGISTERED",
+  "INVALID_ARGUMENT",
+  "NOT_FOUND",
+  "SENDER_ID_MISMATCH"
+]);
+
 export async function sendFcmDataMessage(
   env: Env,
   token: string,
   payload: NotificationPayload,
+  priority: FcmPriority
+): Promise<unknown> {
+  return sendFcmRawData(env, token, { notifly_payload: JSON.stringify(payload) }, priority);
+}
+
+export async function sendFcmRawData(
+  env: Env,
+  token: string,
+  data: Record<string, string>,
   priority: FcmPriority
 ): Promise<unknown> {
   if (env.DEV_SKIP_FCM === "true") {
@@ -108,7 +133,7 @@ export async function sendFcmDataMessage(
       name: "dev/mock-message",
       tokenPreview: `${token.slice(0, 8)}...`,
       priority,
-      payload
+      data
     };
   }
 
@@ -123,21 +148,34 @@ export async function sendFcmDataMessage(
     body: JSON.stringify({
       message: {
         token,
-        android: {
-          priority
-        },
-        data: {
-          notifly_payload: JSON.stringify(payload)
-        }
+        android: { priority },
+        data
       }
     })
   });
 
   const body = await response.text();
   if (!response.ok) {
-    throw new Error(`FCM send failed: ${response.status} ${body}`);
+    const errorCode = extractFcmErrorCode(body);
+    throw new FcmSendError(response.status, errorCode, `FCM send failed: ${response.status} ${errorCode ?? ""} ${body}`.trim());
   }
   return body ? JSON.parse(body) : {};
+}
+
+function extractFcmErrorCode(body: string): string | undefined {
+  if (!body) return undefined;
+  try {
+    const parsed = JSON.parse(body) as {
+      error?: {
+        status?: string;
+        details?: Array<{ "@type"?: string; errorCode?: string }>;
+      };
+    };
+    const detail = parsed.error?.details?.find((d) => d?.errorCode);
+    return detail?.errorCode ?? parsed.error?.status;
+  } catch {
+    return undefined;
+  }
 }
 
 async function getGoogleAccessToken(env: Env): Promise<string> {
