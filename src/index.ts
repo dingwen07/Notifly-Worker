@@ -1,7 +1,7 @@
 import { randomToken, sha256 } from "./crypto";
 import { HttpError, jsonResponse, readJson, requireMethod } from "./http";
 import { sendFcmDataMessage, verifyPlayIntegrity } from "./google";
-import { ChallengeRecord, DeviceRecord, Env, FcmPriority, SendNotificationRequest } from "./types";
+import { ChallengeRecord, DeviceRecord, Env, FcmPriority, SendNotificationRequest, UserRecord } from "./types";
 
 const CHALLENGE_TTL_SECONDS = 300;
 
@@ -17,6 +17,9 @@ export default {
       }
       if (url.pathname === "/v1/devices/register") {
         return await registerDevice(request, env);
+      }
+      if (url.pathname === "/v1/devices/status") {
+        return await deviceStatus(request, env);
       }
       if (url.pathname === "/v1/notifications/send") {
         return await sendNotification(request, env);
@@ -55,6 +58,8 @@ async function registerDevice(request: Request, env: Env): Promise<Response> {
     packageName?: string;
     integrityToken?: string;
     nonce?: string;
+    userId?: string;
+    userKey?: string;
   }>(request);
 
   const clientId = requireString(body.clientId, "clientId");
@@ -77,6 +82,7 @@ async function registerDevice(request: Request, env: Env): Promise<Response> {
   }
 
   const integrityVerdicts = await verifyPlayIntegrity(env, packageName, integrityToken, [nonce, await sha256(nonce)]);
+  const userCredentials = await resolveUser(env, body.userId, body.userKey);
   const existingDeviceId = await env.NOTIFLY_KV.get(clientKey(clientId));
   const deviceId = existingDeviceId ?? randomToken(18);
   const apiKey = randomToken(32);
@@ -86,6 +92,7 @@ async function registerDevice(request: Request, env: Env): Promise<Response> {
   const record: DeviceRecord = {
     deviceId,
     clientId,
+    userId: userCredentials.userId,
     fcmToken,
     apiKeyHash: await sha256(apiKey),
     packageName,
@@ -98,14 +105,40 @@ async function registerDevice(request: Request, env: Env): Promise<Response> {
     env.NOTIFLY_KV.put(deviceKey(deviceId), JSON.stringify(record)),
     env.NOTIFLY_KV.put(clientKey(clientId), deviceId),
     env.NOTIFLY_KV.put(apiKeyLookupKey(await sha256(apiKey)), deviceId),
+    env.NOTIFLY_KV.put(userRecordKey(userCredentials.userId), JSON.stringify(userCredentials.record)),
+    addUserDevice(env, userCredentials.userId, deviceId),
     env.NOTIFLY_KV.delete(challengeKey(nonce))
   ];
   if (existing?.apiKeyHash) {
     writes.push(env.NOTIFLY_KV.delete(apiKeyLookupKey(existing.apiKeyHash)));
   }
+  if (existing?.userId && existing.userId !== userCredentials.userId) {
+    writes.push(removeUserDevice(env, existing.userId, deviceId));
+  }
   await Promise.all(writes);
 
-  return jsonResponse({ deviceId, apiKey, registeredAt: record.registeredAt });
+  return jsonResponse({
+    deviceId,
+    apiKey,
+    userId: userCredentials.userId,
+    userKey: userCredentials.userKey,
+    registeredAt: record.registeredAt
+  });
+}
+
+async function deviceStatus(request: Request, env: Env): Promise<Response> {
+  requireMethod(request, "GET");
+  const device = await authenticate(request, env);
+  return jsonResponse({
+    registered: true,
+    deviceId: device.deviceId,
+    clientId: device.clientId,
+    userId: device.userId,
+    packageName: device.packageName,
+    integrityVerdicts: device.integrityVerdicts,
+    registeredAt: device.registeredAt,
+    updatedAt: device.updatedAt
+  });
 }
 
 async function sendNotification(request: Request, env: Env): Promise<Response> {
@@ -125,7 +158,7 @@ async function sendNotification(request: Request, env: Env): Promise<Response> {
     throw new HttpError(400, "fcmPriority must be NORMAL or HIGH");
   }
 
-  const targets = await resolveTargets(env, caller, body.deviceIds, body.clientIds);
+  const targets = await resolveTargets(env, caller, body.deviceIds, body.clientIds, body.allUserDevices);
   if (targets.length === 0) {
     throw new HttpError(404, "No target devices found");
   }
@@ -169,15 +202,64 @@ async function resolveTargets(
   env: Env,
   caller: DeviceRecord,
   deviceIds: string[] | undefined,
-  clientIds: string[] | undefined
+  clientIds: string[] | undefined,
+  allUserDevices: boolean | undefined
 ): Promise<DeviceRecord[]> {
   const requestedDeviceIds = new Set(deviceIds?.length ? deviceIds : [caller.deviceId]);
   for (const clientId of clientIds ?? []) {
     const deviceId = await env.NOTIFLY_KV.get(clientKey(clientId));
     if (deviceId) requestedDeviceIds.add(deviceId);
   }
+  if (allUserDevices) {
+    const userDeviceIds = await getUserDeviceIds(env, caller.userId);
+    userDeviceIds.forEach((deviceId) => requestedDeviceIds.add(deviceId));
+  }
   const devices = await Promise.all([...requestedDeviceIds].map((id) => env.NOTIFLY_KV.get(deviceKey(id))));
   return devices.filter(Boolean).map((raw) => JSON.parse(raw as string) as DeviceRecord);
+}
+
+async function resolveUser(
+  env: Env,
+  requestedUserId: string | undefined,
+  requestedUserKey: string | undefined
+): Promise<{ userId: string; userKey: string; record: UserRecord }> {
+  if (requestedUserId && requestedUserKey) {
+    const raw = await env.NOTIFLY_KV.get(userRecordKey(requestedUserId));
+    if (raw) {
+      const record = JSON.parse(raw) as UserRecord;
+      if (record.userKeyHash === await sha256(requestedUserKey)) {
+        return { userId: record.userId, userKey: requestedUserKey, record };
+      }
+    }
+  }
+
+  const userId = randomToken(18);
+  const userKey = randomToken(32);
+  return {
+    userId,
+    userKey,
+    record: {
+      userId,
+      userKeyHash: await sha256(userKey),
+      createdAt: new Date().toISOString()
+    }
+  };
+}
+
+async function addUserDevice(env: Env, userId: string, deviceId: string): Promise<void> {
+  const deviceIds = new Set(await getUserDeviceIds(env, userId));
+  deviceIds.add(deviceId);
+  await env.NOTIFLY_KV.put(userDevicesKey(userId), JSON.stringify([...deviceIds]));
+}
+
+async function removeUserDevice(env: Env, userId: string, deviceId: string): Promise<void> {
+  const deviceIds = (await getUserDeviceIds(env, userId)).filter((id) => id !== deviceId);
+  await env.NOTIFLY_KV.put(userDevicesKey(userId), JSON.stringify(deviceIds));
+}
+
+async function getUserDeviceIds(env: Env, userId: string): Promise<string[]> {
+  const raw = await env.NOTIFLY_KV.get(userDevicesKey(userId));
+  return raw ? (JSON.parse(raw) as string[]) : [];
 }
 
 function requireString(value: unknown, name: string): string {
@@ -197,6 +279,14 @@ function deviceKey(deviceId: string): string {
 
 function clientKey(clientId: string): string {
   return `client:${clientId}`;
+}
+
+function userRecordKey(userId: string): string {
+  return `user:${userId}`;
+}
+
+function userDevicesKey(userId: string): string {
+  return `user-devices:${userId}`;
 }
 
 function apiKeyLookupKey(apiKeyHash: string): string {

@@ -5,7 +5,9 @@ export interface Env {
   GOOGLE_SERVICE_ACCOUNT_JSON?: string;
   GOOGLE_SERVICE_ACCOUNT_KEY_JSON_BASE64?: string;
   DEV_SKIP_INTEGRITY?: string;
+  DEV_ENFORCE_INTEGRITY?: string;
   DEV_SKIP_FCM?: string;
+  DEV_LOG_INTEGRITY_VERDICT?: string;
 }
 
 export type FcmPriority = "NORMAL" | "HIGH";
@@ -19,6 +21,7 @@ export interface ChallengeRecord {
 export interface DeviceRecord {
   deviceId: string;
   clientId: string;
+  userId: string;
   fcmToken: string;
   apiKeyHash: string;
   packageName: string;
@@ -27,12 +30,24 @@ export interface DeviceRecord {
   updatedAt: string;
 }
 
+export interface UserRecord {
+  userId: string;
+  userKeyHash: string;
+  createdAt: string;
+}
+
 export interface ApiAction {
   label?: string;
   type: "open_uri" | "intent" | "activity" | "broadcast";
+  packageName?: string;
+  className?: string;
   uri?: string;
+  data?: string;
+  mimeType?: string;
   intentAction?: string;
   activityClass?: string;
+  flags?: string[];
+  categories?: string[];
   extras?: Record<string, string>;
 }
 
@@ -48,6 +63,7 @@ export interface NotificationPayload {
 export interface SendNotificationRequest {
   deviceIds?: string[];
   clientIds?: string[];
+  allUserDevices?: boolean;
   notification: NotificationPayload;
   fcmPriority?: FcmPriority;
 }

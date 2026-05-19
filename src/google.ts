@@ -40,6 +40,7 @@ export async function verifyPlayIntegrity(
   if (env.DEV_SKIP_INTEGRITY === "true") {
     return ["DEV_SKIP_INTEGRITY"];
   }
+  const enforceIntegrity = env.DEV_ENFORCE_INTEGRITY !== "false";
 
   const accessToken = await getGoogleAccessToken(env);
   const url = `https://playintegrity.googleapis.com/v1/${packageName}:decodeIntegrityToken`;
@@ -53,30 +54,44 @@ export async function verifyPlayIntegrity(
   });
 
   if (!response.ok) {
-    throw new Error(`Play Integrity rejected token: ${response.status} ${await response.text()}`);
+    const message = `Play Integrity rejected token: ${response.status} ${await response.text()}`;
+    if (!enforceIntegrity) {
+      console.log(message);
+      return ["DEV_INTEGRITY_NOT_ENFORCED"];
+    }
+    throw new Error(message);
   }
 
   const decoded = await response.json<IntegrityDecodeResponse>();
   const payload = decoded.tokenPayloadExternal;
+  if (env.DEV_LOG_INTEGRITY_VERDICT === "true") {
+    console.log("Play Integrity verdict", JSON.stringify(payload));
+  }
   const request = payload?.requestDetails;
   const app = payload?.appIntegrity;
   const deviceVerdicts = payload?.deviceIntegrity?.deviceRecognitionVerdict ?? [];
+  const account = payload?.accountDetails;
 
   if (request?.requestPackageName !== packageName || app?.packageName !== packageName) {
-    throw new Error("Integrity token package name mismatch");
+    return integrityFailure(enforceIntegrity, "Integrity token package name mismatch", deviceVerdicts);
   }
   const actualNonce = normalizeNonce(request?.nonce);
   const allowedNonces = expectedNonces.map(normalizeNonce);
   if (!actualNonce || !allowedNonces.includes(actualNonce)) {
-    throw new Error(
-      `Integrity nonce mismatch: expected ${await describeNonces(expectedNonces)}, got ${await describeNonce(request?.nonce)}`
+    return integrityFailure(
+      enforceIntegrity,
+      `Integrity nonce mismatch: expected ${await describeNonces(expectedNonces)}, got ${await describeNonce(request?.nonce)}`,
+      deviceVerdicts
     );
   }
   if (app?.appRecognitionVerdict !== "PLAY_RECOGNIZED") {
-    throw new Error("App is not Play recognized");
+    return integrityFailure(enforceIntegrity, "App is not Play recognized", deviceVerdicts);
   }
-  if (!deviceVerdicts.some((verdict) => verdict === "MEETS_DEVICE_INTEGRITY" || verdict === "MEETS_STRONG_INTEGRITY")) {
-    throw new Error("Device integrity verdict is insufficient");
+  if (account?.appLicensingVerdict !== "LICENSED") {
+    return integrityFailure(enforceIntegrity, "App licensing verdict is not licensed", deviceVerdicts);
+  }
+  if (!deviceVerdicts.includes("MEETS_STRONG_INTEGRITY")) {
+    return integrityFailure(enforceIntegrity, "Device must meet strong integrity", deviceVerdicts);
   }
 
   return deviceVerdicts;
@@ -220,4 +235,12 @@ async function describeNonces(nonces: string[]): Promise<string> {
 
 function normalizeNonce(nonce: string | undefined): string | undefined {
   return nonce?.replace(/=+$/g, "");
+}
+
+function integrityFailure(enforceIntegrity: boolean, message: string, verdicts: string[]): string[] {
+  if (enforceIntegrity) {
+    throw new Error(message);
+  }
+  console.log(message);
+  return verdicts.length ? verdicts : ["DEV_INTEGRITY_NOT_ENFORCED"];
 }
