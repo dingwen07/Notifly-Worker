@@ -35,7 +35,7 @@ export async function verifyPlayIntegrity(
   env: Env,
   packageName: string,
   integrityToken: string,
-  expectedNonceHash: string
+  expectedNonces: string[]
 ): Promise<string[]> {
   if (env.DEV_SKIP_INTEGRITY === "true") {
     return ["DEV_SKIP_INTEGRITY"];
@@ -65,9 +65,11 @@ export async function verifyPlayIntegrity(
   if (request?.requestPackageName !== packageName || app?.packageName !== packageName) {
     throw new Error("Integrity token package name mismatch");
   }
-  if (request?.nonce !== expectedNonceHash) {
+  const actualNonce = normalizeNonce(request?.nonce);
+  const allowedNonces = expectedNonces.map(normalizeNonce);
+  if (!actualNonce || !allowedNonces.includes(actualNonce)) {
     throw new Error(
-      `Integrity nonce mismatch: expected ${await describeNonce(expectedNonceHash)}, got ${await describeNonce(request?.nonce)}`
+      `Integrity nonce mismatch: expected ${await describeNonces(expectedNonces)}, got ${await describeNonce(request?.nonce)}`
     );
   }
   if (app?.appRecognitionVerdict !== "PLAY_RECOGNIZED") {
@@ -210,4 +212,12 @@ async function describeNonce(nonce: string | undefined): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(nonce));
   const fingerprint = base64Url(new Uint8Array(digest)).slice(0, 12);
   return `len=${nonce.length} sha256=${fingerprint}`;
+}
+
+async function describeNonces(nonces: string[]): Promise<string> {
+  return (await Promise.all(nonces.map((nonce) => describeNonce(nonce)))).join(" or ");
+}
+
+function normalizeNonce(nonce: string | undefined): string | undefined {
+  return nonce?.replace(/=+$/g, "");
 }

@@ -76,7 +76,7 @@ async function registerDevice(request: Request, env: Env): Promise<Response> {
     throw new HttpError(401, "Challenge mismatch");
   }
 
-  const integrityVerdicts = await verifyPlayIntegrity(env, packageName, integrityToken, nonce);
+  const integrityVerdicts = await verifyPlayIntegrity(env, packageName, integrityToken, [nonce, await sha256(nonce)]);
   const existingDeviceId = await env.NOTIFLY_KV.get(clientKey(clientId));
   const deviceId = existingDeviceId ?? randomToken(18);
   const apiKey = randomToken(32);
